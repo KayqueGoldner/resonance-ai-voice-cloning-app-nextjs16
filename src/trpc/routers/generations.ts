@@ -4,6 +4,7 @@ import * as Sentry from "@sentry/nextjs";
 
 import { chatterbox } from "@/lib/chatterbox-client";
 import { prisma } from "@/lib/db";
+import { polar } from "@/lib/polar";
 import { uploadAudio } from "@/lib/r2";
 import { TEXT_MAX_LENGTH } from "@/features/text-to-speech/data/constants";
 
@@ -70,6 +71,28 @@ export const generationsRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ input, ctx }) => {
+      try {
+        const customerState = await polar.customers.getStateExternal({
+          externalId: ctx.orgId,
+        });
+
+        const hasActiveSubscription =
+          (customerState.activeSubscriptions ?? []).length > 0;
+        if (!hasActiveSubscription) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "SUBSCRIPTION_REQUIRED",
+          });
+        }
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        // customer doesn't exist in Polar yet
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "SUBSCRIPTION_REQUIRED",
+        });
+      }
+
       const voice = await prisma.voice.findUnique({
         where: {
           id: input.voiceId,
@@ -205,6 +228,22 @@ export const generationsRouter = createTRPCRouter({
           message: "Failed to generate audio",
         });
       }
+
+      // ingest usage event to Polar (fire-and-forget, don't block response)
+      polar.events
+        .ingest({
+          events: [
+            {
+              name: "tts_generation",
+              externalCustomerId: ctx.orgId,
+              metadata: { characters: input.text.length },
+              timestamp: new Date(),
+            },
+          ],
+        })
+        .catch(() => {
+          // silent fail - don't break the user experience for metering errors
+        });
 
       return {
         id: generationId,
